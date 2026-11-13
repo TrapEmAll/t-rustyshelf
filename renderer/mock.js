@@ -59,6 +59,9 @@ if(WAVE2)[["nes","NES"],["n64","Nintendo 64"],["gb","Game Boy"],["gbc","Game Boy
 // (?every=1: two games on every one of them, to look at each console's own 3D case)
 if(WAVE2&&/[?&]every=1/.test(location.search))consoles.forEach(c=>{if(titles[c.id]&&!titles[c.id].length){titles[c.id]=["Crystal Run","Moon Patrol X"];folder[c.id]=folder[c.id]||c.name}});
 if(WAVE2){Object.assign(titles,{saturn:["Astral Knights","Panzer Skies"],arcade:["Street Brawlers II","Metal Squad"],atari2600:["Pit Runner"],nds:["Garden Sprites","Tiny Tactics DS"]});Object.assign(folder,{saturn:"Saturn",arcade:"Arcade",atari2600:"Atari 2600",nds:"DS"})}
+// (?arcade=N, discussion 19's walk tests) N synthetic arcade titles across four genres: a big arcade library for the
+// walkable arcade without real ROMs
+{ const m=/[?&]arcade=(\\d+)/.exec(location.search); const n=m?Math.min(4000,+m[1]):0; if(n){const G=["Fighting","Racing","Puzzle","Shooter"];const t=[];for(let i=0;i<n;i++)t.push("Cabinet "+G[i%4]+" "+(i+1));titles.arcade=t;} }
 function mockSw2Builds(){const s=config.systems.sw2||{},B=[["Switch 2 emu\\Selvet Forks\\performance-6\\eglantine.exe","Selvet · Performance 6",false],["Switch 2 emu\\Lichii\\pgo\\lichii.exe","Lichii pgo",true],["Switch 2 emu\\Orchid v0.7.0\\orchid.exe","Orchid v0.7.0",false]].map(([e,label,nup],i)=>({exe:root+"\\"+e,group:"",name:label,label,date:Date.UTC(2026,9,20+i),nup}));
   (Array.isArray(s.buildDirs)?s.buildDirs:[]).forEach((d,i)=>B.push({exe:d+"\\fork-"+i+"\\eglantine.exe",group:"",name:"Fork "+(i+1),label:"Fork "+(i+1),date:Date.UTC(2026,10,1),nup:false}));
   (Array.isArray(s.buildExes)?s.buildExes:[]).forEach(x=>B.push({exe:x,group:"",name:x.split("\\").pop(),label:"Added · "+x.split("\\").pop(),date:Date.UTC(2026,10,2),nup:false}));

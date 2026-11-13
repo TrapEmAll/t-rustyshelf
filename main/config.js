@@ -67,7 +67,7 @@ function defaults() {
       openInto: 'last', display: '', safeArea: 100, clock: 'full', clock24: false, reduceMotion: false, dimMinutes: 0, confirmButton: 'auto', scrollSpeed: 'normal', artRegion: 'auto', audioOut: '', hidden: [],
       // museum room organization: new installs get the themed rooms ('manufacturer' / 'genre'); a config saved before
       // the key existed keeps the single Classic wall (existingUser, below)
-      museumStyle: { walkIn: true, grouping: 'manufacturer' } }
+      museumStyle: { walkIn: true, grouping: 'manufacturer' }, arcadeCap: 24 }
   };
 }
 
@@ -270,6 +270,7 @@ function sanitize(cfg) {
   if (typeof ui.museumStyle.walkIn !== 'boolean') ui.museumStyle.walkIn = true;
   // room organization: classic / manufacturer / genre; anything else falls back to the Classic wall
   if ('grouping' in ui.museumStyle && !['classic', 'manufacturer', 'genre'].includes(ui.museumStyle.grouping)) ui.museumStyle.grouping = 'classic';
+  { const n = +ui.arcadeCap; ui.arcadeCap = Number.isFinite(n) ? Math.round(Math.min(30, Math.max(20, n))) : 24; }
   // the lighting scene (the old moods' ids carry over: gallery is Classic, night Evening, neon Neon night) and the Retro TV's
   // choices: anything unknown is dropped so the room falls back to its default (the Room menu and Settings never show a blank)
   if (ui.museumLight !== undefined && !['gallery', 'daylight', 'night', 'neon', 'spotlit', 'lightsout'].includes(ui.museumLight)) ui.museumLight = 'gallery';

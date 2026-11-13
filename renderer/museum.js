@@ -138,7 +138,7 @@ window.Museum = (() => {
   // pictures still waiting to be read are dropped (and forgotten, so asking again starts a fresh load); nothing is
   // uploaded for a room that's gone
   function dropQueued() { loadQ.forEach(q => { q.t.userData.dead = true; if (tex.get(q.t.userData.url) === q.t) tex.delete(q.t.userData.url); }); loadQ.length = 0; upQ.forEach(upDone); upQ.length = 0; } // decoded but not yet uploaded: marked ready (kept for a reopen, uploaded when first drawn)
-  function teardown() { glGen++; try { disposeTV(); } catch {} dropQueued(); tex.forEach(t => { t.userData.dead = true; }); roomTex.forEach(t => { try { t.dispose(); } catch {} }); roomTex = new Map(); roomObj = null; try { cancelAnimationFrame(raf); if (renderer) { renderer.dispose(); if (!renderer.getContext().isContextLost()) renderer.forceContextLoss(); } /* already lost: forcing it again only warned */ } catch {} try { canvas && canvas.remove(); } catch {} tex.forEach(t => { try { t.dispose(); } catch {} }); tex = new Map(); woodT = floorT = null; renderer = scene = camera = canvas = wall = env = null; fillL = ambL = moonL = null; rimLs = []; active = false; warmed = false; warming = null; }
+  function teardown() { glGen++; try { disposeTV(); } catch {} try { disposeArcade(); } catch {} dropQueued(); tex.forEach(t => { t.userData.dead = true; }); roomTex.forEach(t => { try { t.dispose(); } catch {} }); roomTex = new Map(); roomObj = null; try { cancelAnimationFrame(raf); if (renderer) { renderer.dispose(); if (!renderer.getContext().isContextLost()) renderer.forceContextLoss(); } /* already lost: forcing it again only warned */ } catch {} try { canvas && canvas.remove(); } catch {} tex.forEach(t => { try { t.dispose(); } catch {} }); tex = new Map(); woodT = floorT = null; renderer = scene = camera = canvas = wall = env = null; fillL = ambL = moonL = null; rimLs = []; active = false; warmed = false; warming = null; }
   // the graphics card reset (driver update, sleep / wake, a GPU crash) while you're in the museum: it used to leave a black
   // screen with a wall of dead objects (A on a case then threw). Rebuild the room on a fresh surface, straight to the overview
   // (no walk-in, no opening chord); at most twice a minute, so a card that keeps failing leaves you on a black room B gets out of.
@@ -1214,6 +1214,7 @@ window.Museum = (() => {
     if (!plan) return false;
     // only from safe states: not while something is open, in your hands, or being delivered
     if (holding || heldCase || libHeld || fan || peek || reader || delivery || tvView) return false;
+    if (intro.on) skipFill();
     lastSelByRoom.set(plan.rooms[roomI].id, current() && current().game ? String(current().game.id) : null);
     endPeek(); closeFan(true);
     const ok = buildRoom(to, selId);
@@ -1231,6 +1232,365 @@ window.Museum = (() => {
   // room-aware diagnostics (alongside stats/_perf/_wall): the plan, the active room and what it holds
   function _rooms() { return plan ? { grouping, roomI, wallI, room: plan.rooms[roomI] && { id: plan.rooms[roomI].id, kind: plan.rooms[roomI].kind, title: plan.rooms[roomI].title, gameIds: plan.rooms[roomI].gameIds.length, segments: plan.rooms[roomI].segments.length }, rooms: plan.rooms.length, list: roomList(), roomGen } : null; }
 
+  // ---- the walkable arcade (discussion #19): a real 3D arcade the player explores on foot. One connected world —
+  // foyer, corridor, genre rooms with floor-standing cabinets — built from the pure plan in shared/arcade-plan.js. Every
+  // room's shell stands from the moment the arcade opens (a doorway never looks into a void); cabinets stream in for the
+  // resident rooms (the player's room ±1) and are released beyond that, sharing their geometry so a swap costs only the
+  // room's own textures. The camera, collision and render loop never reset at a threshold: the world is one space. ----
+  const AP = () => window.BSArcadePlan || null;
+  let arcPlan = null, arcWorld = null, arcGeo = null;              // the built world
+  let arcRoomsBuilt = new Map();                                    // roomId → { group, texs, cabinetRoots }
+  let walk = null;                                                  // { x, z, ry, roomId, look:{x,y} } while walking
+  let walkResume = null;                                            // saved across a launch (game exit returns here)
+  const EYE = 1.6, PLAYER_R = .34;
+  const ARC_SIGN = {};                                              // genre key → { bg, fg } room palettes
+  function arcPalette(gk) {
+    if (!ARC_SIGN[gk]) { let h = 0; for (const ch of gk) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+      const hue = (h % 360) / 360;
+      ARC_SIGN[gk] = { hue, bg: new (T().Color)().setHSL(hue, .5, .16), fg: new (T().Color)().setHSL(hue, .75, .62) };
+    }
+    return ARC_SIGN[gk];
+  }
+  function arcEntries() { // the arcade's games from the catalog (the arcade shelf), as plain planner entries
+    const shelf = shelfBySys && shelfBySys['arcade']; if (!shelf) return null;
+    return shelf.games.map(g => ({ id: String(g.id), primaryGenre: g.genre || null, sourceOrder: g.sourceOrder != null ? g.sourceOrder : 0, g }));
+  }
+  // enter from the museum (rooms mode, an arcade room's overview or the Room menu): builds the world if needed and
+  // starts the walk at the foyer. Returns false when there's nothing to walk (no arcade games) or the museum is busy.
+  function enterArcade() {
+    const APc = AP(); if (!APc || !active || !plan) return false;
+    if (holding || heldCase || libHeld || fan || peek || reader || delivery || tvView) return false;
+    const room = plan.rooms[roomI];
+    if (!room || room.kind !== 'arcade') return false;
+    const entries = arcEntries(); if (!entries || !entries.length) return false;
+    if (!arcPlan || arcWorld === null) buildArcade(entries, +(openOpts && openOpts.arcadeCap) || APc.ROOM_CAP);
+    const cameFrom = roomI;
+    walk = walkResume && walkResume.roomId ? Object.assign({}, walkResume, { resume: true }) : { x: arcPlan.foyer.x - 1.2, z: 0, ry: Math.PI / 2, roomId: null, look: { x: 0, y: 0 } }; // (ry π/2 faces +x, toward the corridor)
+    walk.from = cameFrom; walk.on = true; walkResume = null;
+    promoteArcade(walk.roomId || arcPlan.rooms[0].id, true);
+    wide = false; roomView = false; tvView = false; holding = null; heldCase = null;
+    snd('slide'); lastInput = lastNav = woke(); hooks.onSelect && hooks.onSelect(current());
+    if (hooks.log) hooks.log('arcade: entered at the foyer' + (walk.resume ? ' (resumed)' : ''));
+    return true;
+  }
+  function exitArcade() { // B at the museum door, or Esc: back to the museum overview of the room we came from
+    if (!walk) return false;
+    walkResume = null; walk.on = false; walk = null;
+    hooks.onSelect && hooks.onSelect(current());
+    return true;
+  }
+  // one shared set of geometries for every cabinet of a kind (upright / sitdown / cocktail); a room swap disposes only
+  // its own materials and textures
+  function arcGeos() {
+    if (arcGeo || !T()) return arcGeo; const THREE = T(), G = {};
+    const body = (w, h, d, col, rough) => new THREE.MeshStandardMaterial({ color: col, roughness: rough == null ? .55 : rough });
+    G.bodyGeo = new THREE.BoxGeometry(.78, 1.72, .8);
+    G.bodyMat = body(0x14161c);
+    G.panelGeo = new THREE.BoxGeometry(.82, .07, .34);
+    G.panelMat = new THREE.MeshStandardMaterial({ color: 0x23252d, roughness: .4 });
+    G.screenGeo = new THREE.PlaneGeometry(.62, .5);
+    G.marqueeGeo = new THREE.BoxGeometry(.8, .3, .16);
+    G.bezelGeo = new THREE.BoxGeometry(.72, .58, .05);
+    G.bezelMat = new THREE.MeshStandardMaterial({ color: 0x0a0b0e, roughness: .3 });
+    G.coinGeo = new THREE.BoxGeometry(.3, .12, .02);
+    G.coinMat = new THREE.MeshStandardMaterial({ color: 0x8a6a34, metalness: .7, roughness: .35 });
+    G.marcLightGeo = new THREE.BoxGeometry(.84, .02, .2);
+    G.scrMat = new THREE.MeshBasicMaterial({ color: 0x05060a, toneMapped: false });
+    G.marcMat = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false, transparent: true, opacity: .92 });
+    // the sit-down racer: a seat, a wheel column and a big screen
+    G.seatGeo = new THREE.BoxGeometry(.6, .42, .8);
+    G.colGeo = new THREE.CylinderGeometry(.05, .07, .55, 10);
+    // the cocktail table: a low table with the screen flat on top
+    G.tableGeo = new THREE.BoxGeometry(.9, .72, .9);
+    G.topScrGeo = new THREE.PlaneGeometry(.7, .55);
+    return (arcGeo = G);
+  }
+  function buildArcade(entries, cap) {
+    const APc = AP(), THREE = T(); if (!APc || !THREE) return;
+    const t0 = performance.now();
+    arcPlan = APc.planArcade(entries, { cap });
+    arcWorld = new THREE.Group(); scene.add(arcWorld);
+    // the foyer: floor, walls, the museum door and the corridor mouth, lit warmly; the corridor spine: floor + cap wall
+    const f = arcPlan.foyer, floorOf = (w, d, x, z, col, rough) => {
+      const fl = new THREE.Mesh(new THREE.PlaneGeometry(w, d), new THREE.MeshStandardMaterial({ color: col, roughness: rough == null ? .85 : rough }));
+      fl.rotation.x = -Math.PI / 2; fl.position.set(x, 0, z); fl.receiveShadow = true; arcWorld.add(fl); return fl;
+    };
+    const wallOf = (w, h, x, y, z, ry, col) => {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, .14), new THREE.MeshStandardMaterial({ color: col == null ? 0x1a1c26 : col, roughness: .9 }));
+      m.position.set(x, y, z); m.rotation.y = ry == null ? 0 : ry; arcWorld.add(m); return m;
+    };
+    const ceilOf = (w, d, x, z, col) => { const c = new THREE.Mesh(new THREE.PlaneGeometry(w, d), new THREE.MeshStandardMaterial({ color: col == null ? 0x0c0d13 : col, roughness: .95 })); c.rotation.x = Math.PI / 2; c.position.set(x, 3.2, z); arcWorld.add(c); return c; };
+    floorOf(f.w, f.d, f.x, f.z, 0x232633);
+    ceilOf(f.w, f.d, f.x, f.z);
+    wallOf(f.w, 3.2, f.x, 1.6, f.z - f.d / 2); wallOf(f.w, 3.2, f.x, 1.6, f.z + f.d / 2);
+    wallOf(f.d, 3.2, f.x - f.w / 2, 1.6, f.z, Math.PI / 2); // the museum door wall (the door is drawn on it below)
+    // the corridor spine: floor, ceiling, east cap
+    const corW = (arcPlan.corridorEnd - f.x) * 2 + f.w;
+    floorOf(corW, APc.CORRIDOR.w, (arcPlan.corridorEnd + f.x - f.w / 2) / 2, 0, 0x1e212c);
+    ceilOf(corW, APc.CORRIDOR.w, (arcPlan.corridorEnd + f.x - f.w / 2) / 2, 0, 0x0e1016);
+    // the museum door: a lit double door on the foyer's west wall (how you get back)
+    const doorG = new THREE.Group(); doorG.position.set(f.x - f.w / 2 + .08, 0, 0); doorG.rotation.y = Math.PI / 2; arcWorld.add(doorG);
+    const doorM = new THREE.Mesh(new THREE.BoxGeometry(1.7, 2.3, .1), new THREE.MeshStandardMaterial({ color: 0x2a2016, roughness: .6 })); doorM.position.y = 1.15; doorG.add(doorM);
+    const exitT = canvasTex(512, 128, (x, w, h) => { x.fillStyle = '#0e0f14'; x.fillRect(0, 0, w, h); x.fillStyle = '#7fe08a'; x.font = '700 44px Lexend, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText('MUSEUM', w / 2, h / 2); });
+    const exitP = new THREE.Mesh(new THREE.PlaneGeometry(1.4, .35), new THREE.MeshBasicMaterial({ map: exitT, toneMapped: false })); exitP.position.set(0, 2.55, .06); doorG.add(exitP);
+    // the foyer's welcome sign and its light
+    const welT = canvasTex(1024, 256, (x, w, h) => { x.fillStyle = '#12101a'; x.fillRect(0, 0, w, h); x.fillStyle = '#ffd9a8'; x.font = '900 92px Lexend, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText('THE ARCADE', w / 2, h / 2 - 22); x.font = '600 40px Lexend, sans-serif'; x.fillStyle = '#9aa4c0'; x.fillText('doors to the rooms ahead', w / 2, h / 2 + 58); });
+    const welP = new THREE.Mesh(new THREE.PlaneGeometry(3.4, .85), new THREE.MeshBasicMaterial({ map: welT, toneMapped: false })); welP.position.set(f.x + .06, 2.3, f.z + 1.2); welP.rotation.y = Math.PI; arcWorld.add(welP);
+    // corridor lights + the foyer's (a few point lights, always on while the arcade exists: the shader count never changes)
+    const corrL = new THREE.PointLight(0xffdcb0, 0, 9, 2); corrL.position.set(f.x + 1, 2.6, 0); arcWorld.add(corrL); arcPlan.corrLight = corrL;
+    const foyerL = new THREE.PointLight(0xffe4c0, 0, 8, 2); foyerL.position.set(f.x - 1, 2.6, 0); arcWorld.add(foyerL); arcPlan.foyerLight = foyerL;
+    // room shells: every room gets its floor, ceiling, three solid walls, a lit sign over its doorway and two room
+    // lights — cheap, so a doorway always looks into a real room. Cabinets come later, with the resident set.
+    arcPlan.rooms.forEach((r, i) => { const sealed = new THREE.Mesh(new THREE.BoxGeometry(r.w, 3.1, r.d), new THREE.MeshStandardMaterial({ color: 0x0d0e14, roughness: 1 })); sealed.position.set(r.x, 1.55, r.z); arcWorld.add(sealed); r.sealBox = sealed; });
+    // the corridor's doorway frames + signs (over each room's door, visible from anywhere on the corridor)
+    arcPlan.rooms.forEach(r => {
+      const pal = arcPalette(r.genreKey);
+      const sT = canvasTex(512, 128, (x, w, h) => { x.fillStyle = '#' + pal.bg.getHexString(); x.fillRect(0, 0, w, h); x.fillStyle = '#' + pal.fg.getHexString(); x.font = '800 46px Lexend, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; let s = r.plain; while (x.measureText(s).width > w - 30 && s.length > 4) s = s.slice(0, -2); if (s !== r.plain) s += '…'; x.fillText(s.toUpperCase(), w / 2, h / 2); });
+      const sP = new THREE.Mesh(new THREE.PlaneGeometry(2.2, .55), new THREE.MeshBasicMaterial({ map: sT, toneMapped: false }));
+      const above = 2.62, side = r.z < 0 ? -1 : 1;
+      sP.position.set(r.door.x, above, r.door.z - side * .12); if (r.z < 0) sP.rotation.y = Math.PI; else sP.rotation.y = 0; // faces the corridor
+      arcWorld.add(sP);
+      const frame = new THREE.Mesh(new THREE.BoxGeometry(2.2, 2.9, .18), new THREE.MeshStandardMaterial({ color: pal.bg, roughness: .7 }));
+      frame.position.set(r.door.x, 1.45, r.door.z); frame.material.emissive = pal.bg.clone().multiplyScalar(.25); arcWorld.add(frame); // (a frame the door gap sits in: the gap is walked through)
+    });
+    if (hooks.log) hooks.log(`arcade: world built in ${Math.round(performance.now() - t0)} ms (${arcPlan.rooms.length} rooms, ${arcPlan.walls.length} wall segments)`);
+  }
+  function buildRoomShell(r, i) {
+    const THREE = T(), pal = arcPalette(r.genreKey);
+    const g = new THREE.Group(); g.position.set(0, 0, 0); arcWorld.add(g); r.shell = g;
+    const wallCol = new THREE.Color(0x181a24).lerp(pal.bg, .35);
+    const fl = new THREE.Mesh(new THREE.PlaneGeometry(r.w, r.d), new THREE.MeshStandardMaterial({ color: r.cabinetKind === 'sitdown' ? 0x14181f : r.cabinetKind === 'cocktail' ? 0x2a1c14 : 0x1c1f2a, roughness: .9 }));
+    fl.rotation.x = -Math.PI / 2; fl.position.set(r.x, .005, r.z); g.add(fl);
+    const ce = new THREE.Mesh(new THREE.PlaneGeometry(r.w, r.d), new THREE.MeshStandardMaterial({ color: 0x0d0e14, roughness: .95 })); ce.rotation.x = Math.PI / 2; ce.position.set(r.x, 3.1, r.z); g.add(ce);
+    const farZ = r.z < 0 ? r.z - r.d / 2 : r.z + r.d / 2; // (the doorway side faces the corridor, not this one)
+    const far = new THREE.Mesh(new THREE.BoxGeometry(r.w, 3.1, .14), new THREE.MeshStandardMaterial({ color: wallCol, roughness: .9 })); far.position.set(r.x, 1.55, farZ); g.add(far);
+    [-1, 1].forEach(s => { const w = new THREE.Mesh(new THREE.BoxGeometry(.14, 3.1, r.d), new THREE.MeshStandardMaterial({ color: wallCol, roughness: .9 })); w.position.set(r.x + s * (r.w / 2), 1.55, r.z); g.add(w); });
+    // the corridor-side wall: two pieces either side of the 2-wide doorway
+    const doorZ = r.door.z, pieceW = (r.w - 2.2) / 2, cy = 1.55; void doorZ;
+    const doorSideZ = r.z < 0 ? r.z + r.d / 2 : r.z - r.d / 2; // the corridor side, where the 2-wide doorway sits
+    [-1, 1].forEach(s => { const w = new THREE.Mesh(new THREE.BoxGeometry(pieceW, 3.1, .14), new THREE.MeshStandardMaterial({ color: wallCol, roughness: .9 })); w.position.set(r.x + s * (1.1 + pieceW / 2), cy, doorSideZ); g.add(w); }); // (the doorway is the 2.2 gap between them, exactly the planner's)
+    // two room lights (one warm at the back, one cool over the door) — always in the scene while the arcade exists
+    const l1 = new THREE.PointLight(0xffd9a8, 0, 8.5, 2); l1.position.set(r.x, 2.7, farZ + (r.z < 0 ? 1 : -1)); g.add(l1);
+    const l2 = new THREE.PointLight(pal.fg, 0, 7.5, 2); l2.position.set(r.door.x, 2.55, r.z); g.add(l2);
+    r.lights = [l1, l2];
+    // the doorway frame + the room's sign over it, on the corridor (reads from anywhere along the corridor)
+    const pal2 = pal; {
+      const sT = canvasTex(512, 128, (x, w, h) => { x.fillStyle = '#' + pal.bg.getHexString(); x.fillRect(0, 0, w, h); x.fillStyle = '#' + pal.fg.getHexString(); x.font = '800 46px Lexend, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; let s0 = r.plain; while (x.measureText(s0).width > w - 30 && s0.length > 4) s0 = s0.slice(0, -2); if (s0 !== r.plain) s0 += '…'; x.fillText(s0.toUpperCase(), w / 2, h / 2); });
+      const sP = new THREE.Mesh(new THREE.PlaneGeometry(2.2, .55), new THREE.MeshBasicMaterial({ map: sT, toneMapped: false }));
+      const side = r.z < 0 ? -1 : 1;
+      sP.position.set(r.door.x, 2.62, r.door.z - side * .12); sP.rotation.y = r.z < 0 ? Math.PI : 0; g.userData.texs = (g.userData.texs || []).concat(sT); g.userData.signGeo = sP; g.add(sP);
+      const frame = new THREE.Mesh(new THREE.BoxGeometry(2, 2.9, .18), new THREE.MeshStandardMaterial({ color: pal.bg, roughness: .7 }));
+      frame.position.set(r.door.x, 1.45, r.door.z); frame.material.emissive = pal.bg.clone().multiplyScalar(.25); g.add(frame);
+    }
+    // a theme stripe on the far wall (the room reads from the doorway)
+    const stripe = new THREE.Mesh(new THREE.PlaneGeometry(r.w - 1.2, .5), new THREE.MeshBasicMaterial({ color: pal.fg, toneMapped: false, transparent: true, opacity: .3 }));
+    stripe.position.set(r.x, 2.55, farZ + (r.z < 0 ? -.08 : .08)); if (r.z > 0) stripe.rotation.y = Math.PI; g.add(stripe);
+  }
+  // residency: shells for the player's room ±2 (a doorway always opens into a built room), cabinets for ±1 — streamed
+  // ahead of arrival under a per-frame budget (2 promotions per walking frame, everything on entry). A room beyond the
+  // shell radius is one dark sealed box, so the doorway never looks into a void; its cabinets are released beyond ±1
+  // (textures unref'd; the shared geometries and the shell stay until the shell radius passes too).
+  let arcPromoting = null; // the streaming queue: [room…] with shells first, then cabinet rooms
+  function promoteArcade(roomId, force) {
+    if (!arcPlan || !arcWorld) return;
+    const set = arcPlan.resident(roomId, 1);
+    const wantShells = [], wantCabs = [];
+    arcPlan.rooms.forEach(r => {
+      const inShell = set.has(r.id);
+      if (inShell && !r.shell && r.sealBox) wantShells.push(r);
+      if (inShell && !arcRoomsBuilt.has(r.id)) wantCabs.push(r);
+      if (!inShell && r.shell) dropShell(r);
+      if (!inShell && arcRoomsBuilt.has(r.id)) demoteArcadeRoom(r);
+    });
+    arcPromoting = force ? null : { list: wantShells.concat(wantCabs), at: 0 };
+    if (force) wantShells.concat(wantCabs).forEach(r => { if (r.sealBox && !r.shell) promoteShell(r); if (!arcRoomsBuilt.has(r.id)) buildRoomCabinets(r); });
+    else drainArcade(2);
+  }
+  function promoteShell(r) {
+    if (!r.sealBox || r.shell) return;
+    buildRoomShell(r);
+    if (r.sealBox.parent) r.sealBox.parent.remove(r.sealBox);
+    r.sealBox.geometry.dispose(); r.sealBox.material.dispose(); r.sealBox = null;
+  }
+  function dropShell(r) { // the shell leaves the shell radius: its geometry and sign textures go, a sealed box returns
+    if (!r.shell) return;
+    if (r.shell.userData.texs) { r.shell.userData.texs.forEach(t => { try { t.dispose(); } catch {} }); r.shell.userData.texs = null; }
+    if (r.shell.userData.signGeo && r.shell.userData.signGeo.parent) r.shell.userData.signGeo.parent.remove(r.shell.userData.signGeo);
+    r.shell.userData.signGeo = null;
+    if (r.shell.parent) r.shell.parent.remove(r.shell); r.shell = null;
+    if (r.lights) r.lights.forEach(l => { l.intensity = 0; });
+    if (!r.sealBox && T()) { const THREE = T(), sealed = new THREE.Mesh(new THREE.BoxGeometry(r.w, 3.1, r.d), new THREE.MeshStandardMaterial({ color: 0x0d0e14, roughness: 1 })); sealed.position.set(r.x, 1.55, r.z); arcWorld.add(sealed); r.sealBox = sealed; }
+  }
+  function drainArcade(budget) { // the walking frame's promotions: at most `budget` this frame, ~14 ms bounded
+    if (!arcPromoting || !arcWorld) return; const t0 = performance.now(); let n = 0;
+    while (arcPromoting.at < arcPromoting.list.length && n < budget && performance.now() - t0 < 12) {
+      const r = arcPromoting.list[arcPromoting.at++];
+      if (r.sealBox && !r.shell) promoteShell(r);
+      else if (!arcRoomsBuilt.has(r.id) && r.shell) buildRoomCabinets(r);
+      n++;
+    }
+    if (arcPromoting.at >= arcPromoting.list.length) arcPromoting = null;
+  }
+  function buildRoomCabinets(r) {
+    const THREE = T(), G = arcGeos(); if (!G) return;
+    const g = new THREE.Group(); arcWorld.add(g);
+    const texs = [], mats = [];
+    const shelf = shelfBySys && shelfBySys['arcade'];
+    r.gameIds.forEach((id, i) => {
+      const slot = r.slots[i]; if (!slot) return;
+      const game = shelf ? shelf.games.find(x => String(x.id) === id) : null;
+      const cab = new THREE.Group(); cab.position.set(slot.x, 0, slot.z); cab.rotation.y = slot.ry; g.add(cab);
+      const kind = slot.kind;
+      if (kind === 'cocktail') {
+        const table = new THREE.Mesh(G.tableGeo, G.bodyMat); table.position.y = .36; table.castShadow = true; cab.add(table);
+        const top = new THREE.Mesh(G.topScrGeo, G.scrMat); top.rotation.x = -Math.PI / 2; top.position.y = .735; cab.add(top); r._scr = r._scr || []; r._scr.push(top);
+      } else if (kind === 'sitdown') {
+        const seat = new THREE.Mesh(G.seatGeo, G.bodyMat); seat.position.set(0, .55, .45); seat.castShadow = true; cab.add(seat);
+        const col = new THREE.Mesh(G.colGeo, G.bodyMat); col.position.set(0, .8, -.2); cab.add(col);
+        const scr = new THREE.Mesh(G.screenGeo, G.scrMat); scr.position.set(0, 1.35, -.38); cab.add(scr); r._scr = r._scr || []; r._scr.push(scr);
+      } else {
+        const body = new THREE.Mesh(G.bodyGeo, G.bodyMat); body.position.y = .86; body.castShadow = true; cab.add(body);
+        const bez = new THREE.Mesh(G.bezelGeo, G.bezelMat); bez.position.set(0, 1.42, -.36); cab.add(bez);
+        const scr = new THREE.Mesh(G.screenGeo, G.scrMat); scr.position.set(0, 1.42, -.325); cab.add(scr); r._scr = r._scr || []; r._scr.push(scr);
+        const panel = new THREE.Mesh(G.panelGeo, G.panelMat); panel.position.set(0, 1.05, -.28); panel.rotation.x = -.22; panel.castShadow = true; cab.add(panel);
+        const coin = new THREE.Mesh(G.coinGeo, G.coinMat); coin.position.set(0, .62, -.41); cab.add(coin);
+        const marc = new THREE.Mesh(G.marqueeGeo, G.marcMat); marc.position.set(0, 1.92, -.3); cab.add(marc);
+        const title = canvasTex(512, 128, (x, w, h) => { x.fillStyle = '#101018'; x.fillRect(0, 0, w, h); x.fillStyle = '#ffd9a8'; x.font = '700 42px Lexend, sans-serif'; x.textAlign = 'center'; x.textBaseline = 'middle'; let s = game ? game.title : ''; while (x.measureText(s).width > w - 24 && s.length > 4) s = s.slice(0, -2); if (s !== (game ? game.title : '')) s += '…'; x.fillText(s, w / 2, h / 2); });
+        marc.material = marc.material.clone(); marc.material.map = title; texs.push(title); mats.push(marc.material);
+      }
+      // the screen shows the game's cover art where there is one (the usual artwork pipeline; dark glass otherwise)
+      if (game && game.front && typeof game.front === 'string') {
+        const t = loadTex(game.front, 'front'); texs.push(t);
+        r._scrMats = r._scrMats || [];
+        whenLoaded(t, () => { const scr = r._scr && r._scr[i]; if (scr && scr.material === G.scrMat) { const m = G.scrMat.clone(); m.map = t; m.color.set(0xffffff); scr.material = m; mats.push(m); } }, () => {});
+      }
+      cab.userData.game = game; cab.userData.slot = slot; cab.userData.title = game ? game.title : '';
+    });
+    arcRoomsBuilt.set(r.id, { group: g, texs, mats, roomId: r.id });
+  }
+  function demoteArcadeRoom(r) {
+    const have = arcRoomsBuilt.get(r.id); if (!have) return;
+    have.texs.forEach(t => { try { unref(t); } catch {} });
+    have.mats.forEach(m => { try { m.dispose(); } catch {} });
+    if (r._scr) r._scr.length = 0; if (r._scrMats) r._scrMats.length = 0;
+    if (have.group.parent) have.group.parent.remove(have.group);
+    arcRoomsBuilt.delete(r.id);
+  }
+  function disposeArcade() { // the whole arcade goes with the museum (teardown/close)
+    arcPlan.rooms.forEach(r => demoteArcadeRoom(r));
+    if (arcWorld && arcWorld.parent) arcWorld.parent.remove(arcWorld);
+    arcWorld = null; arcPlan = null; arcRoomsBuilt = new Map(); walk = null;
+  }
+  // ---- walking: eye-level movement with collision (wall segments + cabinet footprints) ----
+  function walkBlocked(x, z) {
+    if (!arcPlan) return true;
+    // walls: a segment blocks if the player's circle crosses it (segments are axis-aligned)
+    for (const [x1, z1, x2, z2] of arcPlan.walls) {
+      if (x1 === x2) { const lo = Math.min(z1, z2), hi = Math.max(z1, z2); if (Math.abs(x - x1) < PLAYER_R && z > lo - PLAYER_R && z < hi + PLAYER_R) return true; }
+      else if (z1 === z2) { const lo = Math.min(x1, x2), hi = Math.max(x1, x2); if (Math.abs(z - z1) < PLAYER_R && x > lo - PLAYER_R && x < hi + PLAYER_R) return true; }
+    }
+    // resident cabinet footprints: circles a step wider than the cabinet
+    for (const [, have] of arcRoomsBuilt) {
+      const g = have.group;
+      for (const cab of g.children) { const u = cab.userData; if (!u.slot) continue; const dx = x - u.slot.x, dz = z - u.slot.z; if (dx * dx + dz * dz < (PLAYER_R + .55) * (PLAYER_R + .55)) return true; }
+    }
+    return false;
+  }
+  const walkIn = { dx: 0, dy: 0 }; // the held input: stepWalk integrates it in metres/second (rate-independent)
+  function walkMove(dx, dy, look) { // dx,dy: held stick axes (-1..1); look: {x,y} radians this frame (right stick / drag)
+    walkIn.dx = dx; walkIn.dy = dy; // (a zero call stops: held keys call move every frame)
+    if (!walk) return;
+    if (look) { walk.ry -= look.x; walk.look.y = Math.max(-.6, Math.min(.55, walk.look.y + look.y)); }
+    // movement integrates in stepWalk(dt): metres/second from the held input, substeps so fast motion can't skip a wall
+    // at the museum door: B exits; walking out is how you leave (no fade)
+    lastInput = lastNav = woke();
+  }
+  function arcPushOut(w) { // resolve the player circle against the walls (segments) and cabinet footprints: the
+    // standard slide — walking into a wall keeps the tangential component, so doorways and rows never snag
+    if (!arcPlan) return;
+    for (const [x1, z1, x2, z2] of arcPlan.walls) {
+      if (x1 === x2) { const lo = Math.min(z1, z2), hi = Math.max(z1, z2); if (Math.abs(w.x - x1) < PLAYER_R && w.z > lo - PLAYER_R && w.z < hi + PLAYER_R) { w.x = x1 + (w.x > x1 ? PLAYER_R : -PLAYER_R); } }
+      else { const lo = Math.min(x1, x2), hi = Math.max(x1, x2); if (Math.abs(w.z - z1) < PLAYER_R && w.x > lo - PLAYER_R && w.x < hi + PLAYER_R) { w.z = z1 + (w.z > z1 ? PLAYER_R : -PLAYER_R); } }
+    }
+    for (const [, have] of arcRoomsBuilt) for (const cab of have.group.children) {
+      const u = cab.userData; if (!u.slot) continue; const dx = w.x - u.slot.x, dz = w.z - u.slot.z, d = Math.hypot(dx, dz), min = PLAYER_R + .55;
+      if (d < min && d > 1e-6) { w.x = u.slot.x + dx / d * min; w.z = u.slot.z + dz / d * min; }
+    }
+  }
+  function walkRoomTrack() { // which room is the player in (thresholds change this without any camera reset)
+    // which room is the player in (thresholds change this without any camera reset)
+    let inRoom = null;
+    for (const r of arcPlan.rooms) if (Math.abs(walk.x - r.x) < r.w / 2 && Math.abs(walk.z - r.z) < r.d / 2) { inRoom = r.id; break; }
+    const f = arcPlan.foyer;
+    if (!inRoom && Math.abs(walk.x - f.x) < f.w / 2 && Math.abs(walk.z - f.z) < f.d / 2) inRoom = 'foyer';
+    if (!inRoom) inRoom = 'corridor';
+    if (inRoom !== walk.roomId) {
+      const was = walk.roomId; walk.roomId = inRoom;
+      promoteArcade(inRoom === 'corridor' || inRoom === 'foyer' ? (arcPlan.rooms[0] && arcPlan.rooms[0].id) : inRoom); // shells stream ahead, cabinets with arrival
+      if (hooks.log && was != null) hooks.log(`arcade: ${was} → ${inRoom}`);
+      hooks.onSelect && hooks.onSelect(current());
+    }
+    lastInput = lastNav = woke();
+  }
+  function nearestCabinet() { // the cabinet the prompt is for: within reach and roughly in front
+    if (!walk || !arcPlan) return null; let best = null, bd = 1e9;
+    for (const [, have] of arcRoomsBuilt) for (const cab of have.group.children) {
+      const u = cab.userData; if (!u.slot || !u.game) continue;
+      const dx = u.slot.x - walk.x, dz = u.slot.z - walk.z, d = Math.hypot(dx, dz);
+      if (d > 2.3 || d > bd) continue;
+      const fx = Math.sin(walk.ry), fz = Math.cos(walk.ry);
+      if ((dx * fx + dz * fz) / Math.max(.001, d) < .45) continue; // roughly facing
+      bd = d; best = { cab, d, game: u.game };
+    }
+    return best;
+  }
+  function stepWalk(dt) {
+    if (!walk || !arcWorld) return;
+    { // movement: metres/second from the held input, normalized, substeps of ≤ .25 m so fast motion can't skip a wall
+      const dx = walkIn.dx, dy = walkIn.dy;
+      if (dx || dy) {
+        const m = Math.hypot(dx, dy), k = Math.min(1, m);
+        const sp = (m > 1.2 ? 4.2 : 3.2) * k, sin = Math.sin(walk.ry), cos = Math.cos(walk.ry);
+        const vx = sp * (dy * sin + dx * cos), vz = sp * (dy * cos - dx * sin);
+        const d = Math.min(dt, .05), dist = Math.hypot(vx, vz) * d, steps = Math.max(1, Math.ceil(dist / .25));
+        for (let i = 0; i < steps; i++) {
+          walk.x += (vx / steps) * d; walk.z += (vz / steps) * d;
+          arcPushOut(walk); // (move freely, then push out of any wall/cabinet penetration: natural sliding)
+        }
+      }
+    }
+    walkRoomTrack();
+    // the arcade's lights ride with the room you're in (the corridor and foyer lamps dim in a room, and back);
+    // only built shells have lights — the streamed-in ones light up as their shell lands (buildRoomShell starts them at 0)
+    const inCorridor = walk.roomId === 'corridor' || walk.roomId === 'foyer' || walk.roomId == null;
+    arcPlan.corrLight.intensity = inCorridor ? 1.15 : .35; arcPlan.foyerLight.intensity = walk.roomId === 'foyer' ? 1.2 : .4;
+    arcPlan.rooms.forEach(r => { if (!r.lights) return; const on = r.id === walk.roomId || arcRoomsBuilt.has(r.id); r.lights[0].intensity = on ? 1.05 : 0; r.lights[1].intensity = on ? .8 : 0; });
+    // the camera: eye level at the player's position and heading (the look eases, reduced motion skips the easing)
+    const k = reducedMo() ? 1 : 1 - Math.exp(-dt * 9);
+    camera.position.set(walk.x, EYE + walk.look.y * .9, walk.z);
+    const sin = Math.sin(walk.ry), cos = Math.cos(walk.ry);
+    const fwd = camera.getWorldDirection(sv('wF'));
+    void sin; void cos; void fwd;
+    // look at the heading + the look offset
+    const lx = walk.x + Math.sin(walk.ry) * 3, lz = walk.z + Math.cos(walk.ry) * 3; // the heading's forward (sin, cos)
+    const ly = EYE + walk.look.y * 2.4;
+    camera.lookAt(lx, ly, lz);
+    if (scene.fog) { const fn = Math.max(24, 10), cf = Math.max(110, fn + 70); if (Math.abs(scene.fog.near - 14) > .25) { scene.fog.near = 14; scene.fog.far = 74; } void fn; void cf; }
+    if (scene.background && scene.background.isColor) scene.background.set(0x0a0b12);
+  }
+  function arcadeLaunch() { // A at a cabinet: the existing launch path, with the game's shelf references
+    const n = nearestCabinet(); if (!n) return null;
+    return { game: n.game };
+  }
+
+  function resumeWalk(gameId) { // after a launched game ends: back at the same cabinet, same position and heading
+    if (!walkResume) return false; const from = walkResume; walkResume = null;
+    if (!plan || !plan.rooms[roomI] || plan.rooms[roomI].kind !== 'arcade') return false; // (the museum opened elsewhere: no walk)
+    const ok = enterArcade(); if (!ok) return false;
+    if (from.x != null) { walk.x = from.x; walk.z = from.z; walk.ry = from.ry; walk.roomId = null; walkMove(0, 0); } // (re-detect the room)
+    if (gameId != null) { const loc = arcPlan.locate(gameId); if (loc) { const r = arcPlan.rooms.find(x => x.id === loc.roomId); const slot = r && r.slots[loc.slot]; if (slot) { walk.x = slot.x + Math.sin(slot.ry) * 1.5; walk.z = slot.z + Math.cos(slot.ry) * 1.5; walk.ry = slot.ry; } } }
+    hooks.onSelect && hooks.onSelect(current()); return true; }
+  function saveWalkResume(gameId) { if (!walk || !arcPlan) return; walkResume = { x: walk.x, z: walk.z, ry: walk.ry, roomId: walk.roomId, gameId: gameId != null ? String(gameId) : null }; }
   function open(data, h) {
     if (!ensure()) return false; makeEnv(); const THREE = T(); lastOpen = { data, h };
     hooks = h || {}; active = true; paused = false; pauseWhy.clear(); resize();
@@ -1301,7 +1661,7 @@ window.Museum = (() => {
     hooks.onReady && hooks.onReady(Math.round(performance.now() - t0));
     return true;
   }
-  function close() { lastOpen = null; endPeek(); if (tv) tvOff(); tvView = false; if (delivery) dropDelivery(); opening = null; active = false; if (tvCtx) { try { tvCtx.suspend(); } catch {} } /* the TV's audio graph rests while the museum is closed */ if (sparks) { try { sparks.parent.remove(sparks); sparks.geometry.dispose(); } catch {} sparks = null; } /* an unboxing's sparkle cut short */ cancelAnimationFrame(raf); raf = 0; if (canvas) canvas.classList.remove('on'); setTimeout(() => { if (!active && wall) { disposeWall(); rows = []; work = []; dust = []; card = null; dropQueued(); tex.forEach(t => { try { t.dispose(); } catch {} }); trimTex(24); if (renderer) renderer.setSize(8, 8, false); /* (beta.8) the full-screen drawing buffers go too (open() sizes them again first) */ if (rebuildGL) { rebuildGL = false; teardown(); } } }, 700); } // GPU copies only: the decoded images stay, so reopening re-uploads instead of re-downloading
+  function close() { lastOpen = null; endPeek(); if (walk) { walk = null; } /* a close leaves the arcade: a launch saved the resume first */ try { if (arcWorld) { arcPlan.rooms.forEach(demoteArcadeRoom); if (arcWorld.parent) arcWorld.parent.remove(arcWorld); arcWorld = null; arcPlan = null; arcRoomsBuilt = new Map(); } } catch {} if (tv) tvOff(); tvView = false; if (delivery) dropDelivery(); opening = null; active = false; if (tvCtx) { try { tvCtx.suspend(); } catch {} } /* the TV's audio graph rests while the museum is closed */ if (sparks) { try { sparks.parent.remove(sparks); sparks.geometry.dispose(); } catch {} sparks = null; } /* an unboxing's sparkle cut short */ cancelAnimationFrame(raf); raf = 0; if (canvas) canvas.classList.remove('on'); setTimeout(() => { if (!active && wall) { disposeWall(); rows = []; work = []; dust = []; card = null; dropQueued(); tex.forEach(t => { try { t.dispose(); } catch {} }); trimTex(24); if (renderer) renderer.setSize(8, 8, false); /* (beta.8) the full-screen drawing buffers go too (open() sizes them again first) */ if (rebuildGL) { rebuildGL = false; teardown(); } } }, 700); } // GPU copies only: the decoded images stay, so reopening re-uploads instead of re-downloading
   // the walk-in ends on the whole room (the overview, a gold frame on the shelf you were last on) instead of zooming into a shelf
   function endIntro() { intro.on = false; rows.forEach(r => { r.lampOn = 1; r.lamp.intensity = LAMP(); }); if (!wide && rows.length) { wide = true; wideSel = Math.max(0, Math.min(rows.length - 1, rowI)); hooks.onSelect && hooks.onSelect(current()); } }
   function skipFill() { if (!intro.on) return false; endIntro(); return true; }
@@ -1915,7 +2275,9 @@ window.Museum = (() => {
     if (libBusy()) { libPending = list || []; return; } libPending = null; lastLib = list || []; const was = rackItem(), wasTv = wide && isTvSel(wideSel); buildRack(list); buildTV(); let r = rows[rowI]; if (r && colI > r.boxes.length) colI = Math.min(colI, r.boxes.length + rackLen(rowI));
     if (was && was.d && was.d.id != null && rack) { const id = was.d.id; for (let ri = 0; ri < rows.length; ri++) { const k = (rack.byRow[ri] || []).findIndex(it => it.d && it.d.id === id); if (k >= 0) { if (ri !== rowI && !wide) { rowI = ri; r = rows[ri]; } if (ri === rowI) colI = r.boxes.length + 1 + k; break; } } } // the same magazine stays selected, wherever it moved
     if (was && !rackItem()) colI = r.boxes.length; if (wide) wideSel = wasTv && tv ? tvIdx() : wasTv ? Math.min(Math.max(0, rowI), rows.length - 1) : Math.max(0, Math.min(wideSel, wideCount() - 1)); hooks.onSelect && hooks.onSelect(current()); }
-  function current() { const r = rows[rowI]; if (!r) return null; if (tvView && tv) return { tv: { meta: tv.meta, mode: tv.mode, card: tv.card, ch: room.tvCh || 'ads' }, row: r }; if (wide && tv && isTvSel(wideSel) && !delivery) return { wide: { label: 'Retro TV', sub: TV_CH[room.tvCh] || TV_CH.ads, tv: true, on: !!tv.power }, row: r }; if (delivery) return { delivery: { n: delivery.n, crate: delivery.crate, shelf: dvShelf(delivery.list), open: !!delivery.open, waiting: !delivery.shown }, parcel: delivery.shown && !delivery.open, crate: delivery.crate && !delivery.open ? delivery.n : 0, row: r }; if (wide && wideSel < wideCount()) { const b = wideBox(wideSel), gi = isGalSel(wideSel), ru = !gi && wideSel >= rows.length && rack && rack.units && rack.units[wideSel - rows.length] || null; return { wide: { label: b.label, sub: b.sub, rack: !gi && wideSel >= rows.length, gal: gi, kind: ru ? (ru.movie ? 'movie' : ru.guide ? 'guide' : 'magazine') : null, empty: ru ? !ru.n : false }, row: r }; } if (libHeld && libHeld.temp) return { lib: libHeld.d, row: rows[libHeld.ri] || r }; /* (beta.11) an issue picked up out of a fan */ if (fan && !fan.closing) return { lib: fan.it.box.issues[fan.i], fan: { i: fan.i, n: fan.n, series: fan.it.box.series, year: fan.it.box.years[fan.i] || 0 }, row: rows[fan.it.ri] || r }; if (colI > r.boxes.length) { const it = rackItem(); if (it) return it.box ? { lib: it.d, stack: { series: it.box.series, n: it.box.issues.length, years: yearSpan(it.box.years), guide: it.d.kind === 'guide' }, row: r } : { lib: it.d, row: r }; } if (colI >= r.boxes.length) return { console: true, row: r }; const bx = r.boxes[colI]; return { game: bx.userData.g, sealed: !!bx.userData.sleeve, row: r }; }
+  function current() { return (walk && arcPlan) ? currentWalk() : current0(); }
+  function currentWalk() { if (walk && arcPlan) { const n = nearestCabinet(); const inFoyer = walk.roomId === 'foyer'; return { walk: { room: walk.roomId, x: +walk.x.toFixed(2), z: +walk.z.toFixed(2), atDoor: inFoyer && walk.x < arcPlan.foyer.x + 1.6, cabinet: n ? { title: n.game.title, d: +n.d.toFixed(2) } : null }, row: rows[rowI] || null }; } return current0(); }
+  function current0() { const r = rows[rowI]; if (!r) return null; if (tvView && tv) return { tv: { meta: tv.meta, mode: tv.mode, card: tv.card, ch: room.tvCh || 'ads' }, row: r }; if (wide && tv && isTvSel(wideSel) && !delivery) return { wide: { label: 'Retro TV', sub: TV_CH[room.tvCh] || TV_CH.ads, tv: true, on: !!tv.power }, row: r }; if (delivery) return { delivery: { n: delivery.n, crate: delivery.crate, shelf: dvShelf(delivery.list), open: !!delivery.open, waiting: !delivery.shown }, parcel: delivery.shown && !delivery.open, crate: delivery.crate && !delivery.open ? delivery.n : 0, row: r }; if (wide && wideSel < wideCount()) { const b = wideBox(wideSel), gi = isGalSel(wideSel), ru = !gi && wideSel >= rows.length && rack && rack.units && rack.units[wideSel - rows.length] || null; return { wide: { label: b.label, sub: b.sub, rack: !gi && wideSel >= rows.length, gal: gi, kind: ru ? (ru.movie ? 'movie' : ru.guide ? 'guide' : 'magazine') : null, empty: ru ? !ru.n : false }, row: r }; } if (libHeld && libHeld.temp) return { lib: libHeld.d, row: rows[libHeld.ri] || r }; /* (beta.11) an issue picked up out of a fan */ if (fan && !fan.closing) return { lib: fan.it.box.issues[fan.i], fan: { i: fan.i, n: fan.n, series: fan.it.box.series, year: fan.it.box.years[fan.i] || 0 }, row: rows[fan.it.ri] || r }; if (colI > r.boxes.length) { const it = rackItem(); if (it) return it.box ? { lib: it.d, stack: { series: it.box.series, n: it.box.issues.length, years: yearSpan(it.box.years), guide: it.d.kind === 'guide' }, row: r } : { lib: it.d, row: r }; } if (colI >= r.boxes.length) return { console: true, row: r }; const bx = r.boxes[colI]; return { game: bx.userData.g, sealed: !!bx.userData.sleeve, row: r }; }
   // Hands-on: A takes the case off the shelf into your hands (the room dims, a light falls on it) and the stick turns it.
   // X opens it on its hinge (the spine side): the disc / cartridge sits in the tray and the manual is clipped inside
   // the lid. X again takes the disc out (hold A then plays it), Y lifts the manual out to read, page by page. B steps
@@ -2156,6 +2518,7 @@ window.Museum = (() => {
     for (let d = 0; d <= 4; d++) for (let sg = -1; sg <= 1; sg += 2) { const b = r.boxes[c + d * sg]; if (b && !b.userData.frontLoaded && !b.userData.mail) { loadFront(b); return; } if (!d) break; }
   }
   function move(dx, dy) {
+    if (walk) { walkMove(dx, dy); return; } // walking: the left stick (or WASD/arrows) moves, the right stick / Q E / drag look
     if (tvView) { lastInput = woke(); if (dx) hooks.onTvChannel && hooks.onTvChannel(dx); else if (dy) hooks.onTvBand && hooks.onTvBand(dy); return; } // the TV: left / right what's on, up / down the channel
     if (delivery) { if (delivery.shown && !delivery.open) { const ro = delivery.rot; ro.ty += dx * 45 * DEG; ro.tx = Math.max(-55 * DEG, Math.min(55 * DEG, ro.tx + dy * 30 * DEG)); lastInput = woke(); } return; } // the package in front of you: turn it to look it over
     if (!rows[rowI]) return; // closed (the wall already let go) or not built yet
@@ -2173,11 +2536,12 @@ window.Museum = (() => {
     if (dx) { const r = rows[rowI]; colI = Math.max(0, Math.min(r.boxes.length + rackLen(rowI), colI + dx)); }
     hooks.onSelect && hooks.onSelect(current());
   }
-  function jump(n) { if (delivery || tvView) return; lastInput = lastNav = woke(); if (fan) { fanJump(Math.sign(n)); return; } const r = rows[rowI]; if (!r || holding || heldCase || libHeld) return;
+  function jump(n) { if (delivery || tvView) return; lastInput = lastNav = woke(); if (walk) { walk.ry -= Math.sign(n) * 90 * DEG; return; } if (fan) { fanJump(Math.sign(n)); return; } const r = rows[rowI]; if (!r || holding || heldCase || libHeld) return;
     if (wide && plan && wallGroups && !intro.on) { stepRoom(Math.sign(n)); return; } // room mode, stepped back: L1/R1 walk the room directory
     colI = Math.max(0, Math.min(r.boxes.length + rackLen(rowI), colI + n)); hooks.onSelect && hooks.onSelect(current()); }
   function activate() {
     lastInput = woke(); if (intro.on) { skipFill(); return null; }
+    if (walk) { const a = arcadeLaunch(); return a ? { arcadePlay: a.game } : null; } // at a cabinet: launch it
     if (tvView) return { tvPlay: true };
     if (delivery) { if (delivery.open) { skipOpening(); return { skipped: true }; } return delivery.shown ? { parcelTap: true } : null; }
     if (fan && !(libHeld && libHeld.temp)) { if (fan.closing) return null; const d = fan.it.box.issues[fan.i]; if (libSealed(d)) return { sealedLib: true }; return { lib: d }; } // (beta.11: an issue picked up from it is handled as libHeld below)
@@ -2198,6 +2562,9 @@ window.Museum = (() => {
   }
   function back() {
     lastInput = woke(); if (intro.on) { skipFill(); return true; }
+    if (walk) { // the arcade: B at the foyer's museum door walks out; anywhere else it turns you around
+      if (walk.roomId === 'foyer' && walk.x < arcPlan.foyer.x + 1.6) { exitArcade(); snd('slideBack'); return true; }
+      walk.ry += 180 * DEG; walk.ry = Math.atan2(Math.sin(walk.ry), Math.cos(walk.ry)); snd('tick', { dir: 1 }); hooks.onSelect && hooks.onSelect(current()); return true; }
     if (gaze) { gaze = null; look.tx = look.ty = 0; hooks.onSelect && hooks.onSelect(current()); return true; } // B while leaning to a side display: back to the whole wall
     if (delivery) { if (delivery.shown) skipOpening(); return true; }
     if (tvView) { tvView = false; if (tvReturn && rows[tvReturn.rowI]) { rowI = tvReturn.rowI; colI = tvReturn.colI; wide = false; } else { wide = true; wideSel = tv ? tvIdx() : Math.min(Math.max(0, rowI), rows.length - 1); } tvReturn = null; hooks.onSelect && hooks.onSelect(current()); return true; } // off the TV, back where you were (it keeps playing; X switches it off)
@@ -2215,6 +2582,7 @@ window.Museum = (() => {
     return false; // B at a room's overview leaves the museum; rooms are navigated with L1 / R1 and the Rooms directory
   }
   function turn(dx, dy) { lastInput = woke();
+    if (walk) { const k = reducedMo() ? .5 : 1; walkMove(0, 0, { x: dx * .5 * k * DEG, y: dy * .3 * k * DEG }); return; }
     if (!holding && !heldCase && !libHeld) { // nothing in your hands: look around the wide view (the stick, a mouse drag, Q / E)
       if (!lookFree()) return; lookIn = performance.now(); const k = reducedMo() ? .35 : 1;
       look.tx = Math.max(-.62, Math.min(.62, look.tx - dx * .5 * k * DEG));
@@ -2305,7 +2673,7 @@ window.Museum = (() => {
         rw.lampOn = Math.max(rw.lampOn, Math.min(1, e)); rw.lamp.intensity = LAMP() * Math.max(0, strike) * over; });
       camTarget = overview(); // drift in to the overview while the lights come on, and stay on it
       if (intro.t > intro.len) endIntro();
-    } else camTarget = wallTurn && camTargetOnce ? camTargetOnce : tvView && tv ? tvView0() : roomView ? (tv && now - tvPeekAt < (window.__musPeekMs || 2600) ? tvPeekView() : roomOverview()) : wide ? (gaze ? gaze : overview()) : rowView();
+    } else if (walk) { drainArcade(2); stepWalk(dt); drawFrame(); maybeSleep(now); facc.n++; return; } else camTarget = wallTurn && camTargetOnce ? camTargetOnce : tvView && tv ? tvView0() : roomView ? (tv && now - tvPeekAt < (window.__musPeekMs || 2600) ? tvPeekView() : roomOverview()) : wide ? (gaze ? gaze : overview()) : rowView();
     // a view worked out while the window was minimised (0 × 0: the fit maths divides by it) is NaN, and the camera eases toward
     // its target, so one NaN froze it there for good (a black room after restoring the window): hold still instead
     if (!isFinite(camTarget.x + camTarget.y + camTarget.z)) camTarget = { x: camP.x, y: camP.y, z: camP.z };
@@ -2641,5 +3009,5 @@ window.Museum = (() => {
     hooks.onSelect && hooks.onSelect(current()); return true; }
   function glStats() { if (!renderer) return null; const i = renderer.info; let lights = 0, shadowL = 0; scene && scene.traverse(o => { if (o.isLight && o.visible && o.intensity > 0) { lights++; if (o.castShadow) shadowL++; } }); return { calls: i.render.calls, tris: i.render.triangles, geos: i.memory.geometries, texs: i.memory.textures, progs: (i.programs || []).length, progNames: (i.programs || []).map(p => p.name + '#' + p.id), lights, shadowL, pr: renderer.getPixelRatio(), aa: !!(renderer.getContext().getContextAttributes() || {}).antialias, shadows: renderer.shadowMap.enabled }; }
   return { _wall: () => ({ rows: rows.map(r => ({ id: r.id, name: r.name, n: r.boxes.length })), lights: (() => { let n = 0; if (scene) scene.traverse(o => { if (o.isSpotLight && o.parent && o.visible !== false) n++; }); return n; })(), pooled: lampPooled(), rowI, wide, wideSel, pool: lampPool ? lampPool.map(l => ({ x: +l.position.x.toFixed(3), y: +l.position.y.toFixed(3), on: l.intensity > 0 })) : null, want: rows[rowI] && rows[rowI].lamp && rows[rowI].group ? { x: +rows[rowI].lamp.position.x.toFixed(3), y: +(rows[rowI].lamp.position.y + rows[rowI].group.position.y).toFixed(3) } : null }), // (issue 17's test: the shelves and how many spot lights light them)
-    _perf: reset => { const o = Object.assign({}, facc), r = rows[rowI]; o.pending = r ? r.boxes.filter((b, i) => Math.abs(i - colI) <= 4 && !b.userData.mail && !b.userData.frontLoaded).length : -1; if (reset) Object.keys(facc).forEach(k => facc[k] = 0); return o; }, stats: glStats, rooms: _rooms, roomList, roomDir: () => roomDir, roomDirOpen, roomDirClose, roomDirMove, roomDirGo, stepRoom, gotoRoom, _lod: () => ({ far: rows.filter(r => r.lodFar).length, near: rows.filter(r => !r.lodFar).length, rows: rows.length }), tvShow, tvCard, tvStatic, tvOff, tvVolume, watchTv, tvMeta: () => tv && tv.power ? tv.meta : null, tvPower: on => { tvPower(!!on); hooks.onSelect && hooks.onSelect(current()); }, tvPowered: () => !!(tv && tv.power), tvAvail: () => !!tv, showTv, _tv: () => tv && { mode: tv.mode, power: tv.power, pow: tv.pow, gain: tv.gain, gt: tv.gT, base: tv.base, vol: tv.video ? tv.video.volume : null, t: tv.video ? tv.video.currentTime : null, playing: tv.video ? !tv.video.paused : null, spatial: !!(tv.video && tvRoute.get(tv.video)), carry: !!tvCarry && !!tvCarry.video, box: [tv.box.min.x, tv.box.max.x, tv.box.min.y, tv.box.max.y], card: tv.card && tv.card.title, crt: tvM && tvM.U.uCrt.value, prog: tv.screen.material === (tvM && tvM.screenV) ? 'video' : 'still' }, lightFade: () => lightK, _dv: () => delivery && { rot: delivery.rot, shown: delivery.shown, ot: delivery.open && delivery.open.t }, skipDelivery, setHoldA: v => { holdA = !!v; }, resealAll, opened: () => unwrapped.size, preloadModel, _snapCam: () => { snapCam = true; }, _cam: () => ({ x: camP.x, y: camP.y, z: camP.z, tx: lastTg ? lastTg.x : 0, ty: lastTg ? lastTg.y : 0, tz: lastTg ? lastTg.z : 0, on: tw.on, s: tw.s, t: tw.t, d: tw.d, zoom: tw.zoom, key: twKey, pre: preOn ? preRow : -1, fk: wideFrame ? wideFrame.userData.k : 0, up: fst.up, fr: fst.fr, sp: fst.sp, sh: fst.sh, row: fst.row, js: fst.jsMs, upQ: upQ.length }), setRoomView: on => { roomView = !!on; lastInput = woke(); }, setGuideView: on => { guideView = !!on; lastInput = woke(); }, setLibrary, consoleFit, setConsoleFit, toConsole, setRoom, room: () => Object.assign({}, room), handX, handY, handState, wrapPull, unwrapHeld, zoomHand, panHand, leanHand, turnPage, readerZoom, readerPan, lights: () => Object.entries(LIGHTS).map(([id, l]) => [id, l.name]), setLighting, lighting: () => lightId, _rows: () => rows, _rack: () => rack && rack.items, available, open, close, warm, _lights: () => { let n = 0, spots = 0; if (scene) scene.traverseVisible(o => { if (o.isLight) { n++; if (o.isSpotLight) spots++; } }); return { n, spots }; }, setPaused: (p, why = 'x') => { if (p) pauseWhy.add(why); else pauseWhy.delete(why); paused = pauseWhy.size > 0; if (!paused && active && !raf) { lastT = 0; raf = requestAnimationFrame(frame); } }, wake: () => { if (window.bsPlatform && window.bsPlatform.os === 'android') lastInput = woke(); } /* a change from outside (the bottom screen, the Room menu) counts as input: woken, and not straight back to sleep */, sleeping: () => pauseWhy.has('idle') /* (the reader and the dimmed screen each hold their own pause: waking from a dim mustn't unpause under an open magazine) */, setShadows: on => { window.__musNoShadows = !on; if (renderer) { renderer.shadowMap.enabled = wantShadows(); renderer.shadowMap.needsUpdate = true; rows.forEach(r => { r.lamp.castShadow = false; }); shadowRow = -1; } }, move, jump, activate, back, bottomRow, pickCol, pickAt, unwrapCol, refreshArt, turn, release, skipFill, current, fanLift /* (beta.11) Y in a file box's fan */, isActive: () => active, isHolding: () => !!holding || !!heldCase || !!libHeld, isHoldingCase: () => !!heldCase, isFilling: () => intro.on, isWide: () => wide, setRow: i => { rowI = Math.max(0, i | 0); colI = 0; } };
+    _perf: reset => { const o = Object.assign({}, facc), r = rows[rowI]; o.pending = r ? r.boxes.filter((b, i) => Math.abs(i - colI) <= 4 && !b.userData.mail && !b.userData.frontLoaded).length : -1; if (reset) Object.keys(facc).forEach(k => facc[k] = 0); return o; }, stats: glStats, rooms: _rooms, roomList, enterArcade, exitArcade, resumeWalk, isWalking: () => !!(walk && walk.on), setWalkHeading: d => { if (walk) walk.ry = (+d || 0) * DEG; }, walkState: () => walk && { x: walk.x, z: walk.z, ry: +walk.ry.toFixed(2), room: walk.roomId }, arcadeBuilt: () => !!arcWorld, _arcade: () => arcPlan && { rooms: arcPlan.rooms.map(r => ({ id: r.id, x: r.x, z: r.z, doorX: r.door.x, doorZ: r.door.z, side: r.z < 0 ? "N" : "S" })), foyer: arcPlan.foyer, museumDoor: arcPlan.museumDoor }, roomDir: () => roomDir, roomDirOpen, roomDirClose, roomDirMove, roomDirGo, stepRoom, gotoRoom, _lod: () => ({ far: rows.filter(r => r.lodFar).length, near: rows.filter(r => !r.lodFar).length, rows: rows.length }), tvShow, tvCard, tvStatic, tvOff, tvVolume, watchTv, tvMeta: () => tv && tv.power ? tv.meta : null, tvPower: on => { tvPower(!!on); hooks.onSelect && hooks.onSelect(current()); }, tvPowered: () => !!(tv && tv.power), tvAvail: () => !!tv, showTv, _tv: () => tv && { mode: tv.mode, power: tv.power, pow: tv.pow, gain: tv.gain, gt: tv.gT, base: tv.base, vol: tv.video ? tv.video.volume : null, t: tv.video ? tv.video.currentTime : null, playing: tv.video ? !tv.video.paused : null, spatial: !!(tv.video && tvRoute.get(tv.video)), carry: !!tvCarry && !!tvCarry.video, box: [tv.box.min.x, tv.box.max.x, tv.box.min.y, tv.box.max.y], card: tv.card && tv.card.title, crt: tvM && tvM.U.uCrt.value, prog: tv.screen.material === (tvM && tvM.screenV) ? 'video' : 'still' }, lightFade: () => lightK, _dv: () => delivery && { rot: delivery.rot, shown: delivery.shown, ot: delivery.open && delivery.open.t }, skipDelivery, setHoldA: v => { holdA = !!v; }, resealAll, opened: () => unwrapped.size, preloadModel, _snapCam: () => { snapCam = true; }, _cam: () => ({ x: camP.x, y: camP.y, z: camP.z, tx: lastTg ? lastTg.x : 0, ty: lastTg ? lastTg.y : 0, tz: lastTg ? lastTg.z : 0, on: tw.on, s: tw.s, t: tw.t, d: tw.d, zoom: tw.zoom, key: twKey, pre: preOn ? preRow : -1, fk: wideFrame ? wideFrame.userData.k : 0, up: fst.up, fr: fst.fr, sp: fst.sp, sh: fst.sh, row: fst.row, js: fst.jsMs, upQ: upQ.length }), setRoomView: on => { roomView = !!on; lastInput = woke(); }, setGuideView: on => { guideView = !!on; lastInput = woke(); }, setLibrary, consoleFit, setConsoleFit, toConsole, setRoom, room: () => Object.assign({}, room), handX, handY, handState, wrapPull, unwrapHeld, zoomHand, panHand, leanHand, turnPage, readerZoom, readerPan, lights: () => Object.entries(LIGHTS).map(([id, l]) => [id, l.name]), setLighting, lighting: () => lightId, _rows: () => rows, _rack: () => rack && rack.items, available, open, close, warm, _lights: () => { let n = 0, spots = 0; if (scene) scene.traverseVisible(o => { if (o.isLight) { n++; if (o.isSpotLight) spots++; } }); return { n, spots }; }, setPaused: (p, why = 'x') => { if (p) pauseWhy.add(why); else pauseWhy.delete(why); paused = pauseWhy.size > 0; if (!paused && active && !raf) { lastT = 0; raf = requestAnimationFrame(frame); } }, wake: () => { if (window.bsPlatform && window.bsPlatform.os === 'android') lastInput = woke(); } /* a change from outside (the bottom screen, the Room menu) counts as input: woken, and not straight back to sleep */, sleeping: () => pauseWhy.has('idle') /* (the reader and the dimmed screen each hold their own pause: waking from a dim mustn't unpause under an open magazine) */, setShadows: on => { window.__musNoShadows = !on; if (renderer) { renderer.shadowMap.enabled = wantShadows(); renderer.shadowMap.needsUpdate = true; rows.forEach(r => { r.lamp.castShadow = false; }); shadowRow = -1; } }, move, jump, activate, back, bottomRow, pickCol, pickAt, unwrapCol, refreshArt, turn, release, skipFill, current, fanLift /* (beta.11) Y in a file box's fan */, isActive: () => active, isHolding: () => !!holding || !!heldCase || !!libHeld, isHoldingCase: () => !!heldCase, isFilling: () => intro.on, isWide: () => wide, setRow: i => { rowI = Math.max(0, i | 0); colI = 0; } };
 })();
